@@ -1,0 +1,27 @@
+[user]
+	email = joseelizalde86@yahoo.com
+	name = Jose Elizalde
+[credential]
+	helper = store
+[pull]
+	rebase = false
+[core]
+	editor = nvim --embed
+[init]
+    defaultBranch = main
+
+[core]
+    pager = delta
+
+[interactive]
+    diffFilter = delta --color-only
+[delta]
+    navigate = true
+    dark = true
+    side-by-side = true
+
+[merge]
+    conflictstyle = diff3
+
+[diff]
+    colorMoved = default
