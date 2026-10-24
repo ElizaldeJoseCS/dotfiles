@@ -1,6 +1,4 @@
 vim.opt.termguicolors = true
-
-
 -- (the rest of the plugin list is installed further down, near PLUGINS)
 vim.pack.add({
 	"https://github.com/savq/melange-nvim",
@@ -38,10 +36,7 @@ set_transparent()
 -- ============================================================================
 vim.opt.number = true -- line number
 vim.opt.cursorline = true -- highlight current line
-vim.opt.wrap = true --  wrap lines by default
-vim.opt.linebreak = true
-vim.opt.breakindent = true
-vim.opt.showbreak = "↳ " -- visual marker for wrapped continuation lines
+vim.opt.wrap = false -- do not wrap lines by default
 vim.opt.scrolloff = 10 -- keep 10 lines above/below cursor
 vim.opt.sidescrolloff = 10 -- keep 10 lines to left/right of cursor
 
@@ -143,6 +138,7 @@ vim.keymap.set("x", "<leader>p", '"_dP', { desc = "Paste without yanking" })
 vim.keymap.set({ "n", "v" }, "<leader>v", '"_d', { desc = "Delete without yanking" })
 vim.keymap.set("n", "<leader>o", "o<Esc>", { desc = "New line below (stay normal)" })
 vim.keymap.set("n", "<leader>O", "O<Esc>", { desc = "New line above (stay normal)" })
+vim.keymap.set("n", "<leader>=", "`[v`]=", { desc = "Reindent last paste" })
 
 vim.keymap.set("n", "<leader>bn", ":bnext<CR>", { desc = "Next buffer" })
 vim.keymap.set("n", "<leader>bp", ":bprevious<CR>", { desc = "Previous buffer" })
@@ -205,44 +201,74 @@ end, { desc = "Toggle diagnostics" })
 
 -- Delete inside nearest surrounding delimiter (quotes, parens, brackets, braces)
 do
-	-- For matching open/close pairs, use searchpairpos
-	local pairs = {
+	-- matching open/close pairs use searchpairpos (these can span lines)
+	local bracket_pairs = {
 		{ open = "(", close = ")" },
 		{ open = "[", close = "]" },
 		{ open = "{", close = "}" },
 	}
-	-- For identical delimiters, search backward then forward
+	-- identical delimiters are scanned within the current line
 	local singles = { '"', "'", "`" }
 
+	-- true if position a is later in the buffer than b (i.e. nearer the cursor)
+	local function nearer(a, b)
+		if not b then
+			return true
+		end
+		if a[1] ~= b[1] then
+			return a[1] > b[1]
+		end
+		return a[2] > b[2]
+	end
+
+	-- true when the char at 1-based index i is preceded by an odd number of backslashes
+	local function is_escaped(line, i)
+		local n, j = 0, i - 1
+		while j >= 1 and line:sub(j, j) == "\\" do
+			n = n + 1
+			j = j - 1
+		end
+		return n % 2 == 1
+	end
+
+	-- walk the line pairing up quotes, return the pair containing ccol
+	local function find_quote_pair(line, ch, ccol)
+		local open, best = nil, nil
+		for i = 1, #line do
+			if line:sub(i, i) == ch and not is_escaped(line, i) then
+				if open == nil then
+					open = i
+				else
+					if open <= ccol and ccol <= i then
+						best = { open = open, close = i }
+					end
+					open = nil
+				end
+			end
+		end
+		return best
+	end
+
 	local function find_nearest()
-		local cursor = vim.api.nvim_win_get_cursor(0)
+		local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+		local ccol = col + 1 -- 1-based column
+		local line = vim.api.nvim_get_current_line()
 		local best = nil
 
-		-- check pairs
-		for _, d in ipairs(pairs) do
-			local o = vim.fn.searchpairpos(d.open, "", d.close, "bnW", "", 0, 50)
+		for _, d in ipairs(bracket_pairs) do
+			local o = vim.fn.searchpairpos("\\V" .. d.open, "", "\\V" .. d.close, "bnW", "", 0, 50)
 			if o[1] > 0 then
-				local c = vim.fn.searchpairpos(d.open, "", d.close, "nW", "", 0, 50)
-				if c[1] > 0 and not best then
-					best = { open = o, close = c, is_single = false }
+				local c = vim.fn.searchpairpos("\\V" .. d.open, "", "\\V" .. d.close, "nW", "", 0, 50)
+				if c[1] > 0 and nearer(o, best and best.open) then
+					best = { open = o, close = c }
 				end
 			end
 		end
 
-		-- check single-char delimiters
 		for _, ch in ipairs(singles) do
-			-- search backward for opening
-			local o = vim.fn.searchpos("\\V" .. ch, "bnW")
-			if o[1] > 0 then
-				-- make sure we're inside the pair: search forward for closing from o+1
-				vim.api.nvim_win_set_cursor(0, { o[1], o[2] + 1 })
-				local c = vim.fn.searchpos("\\V" .. ch, "nW", 0, 50)
-				vim.api.nvim_win_set_cursor(0, cursor)
-				if c[1] > 0 and (c[1] > o[1] or (c[1] == o[1] and c[2] > o[2])) then
-					if not best or (o[1] > best.open[1] or (o[1] == best.open[1] and o[2] >= best.open[2])) then
-						best = { open = o, close = c, is_single = true }
-					end
-				end
+			local q = find_quote_pair(line, ch, ccol)
+			if q and nearer({ row, q.open }, best and best.open) then
+				best = { open = { row, q.open }, close = { row, q.close } }
 			end
 		end
 
@@ -259,13 +285,18 @@ do
 		local er, ec = match.close[1] - 1, match.close[2] - 1
 		vim.api.nvim_buf_set_text(0, sr, sc, er, ec, { "" })
 		vim.api.nvim_win_set_cursor(0, { match.open[1], match.open[2] })
-		vim.cmd("startinsert!")
+		vim.cmd("startinsert")
 	end
 
-	vim.keymap.set("n", "<leader>di", delete_inside_nearest, { noremap = true, silent = true, desc = "Delete inside nearest delimiter" })
-end
+	vim.keymap.set(
+		"n",
+		"<leader>di",
+		delete_inside_nearest,
+		{ noremap = true, silent = true, desc = "Delete inside nearest delimiter" }
+	)
+end 
 
--- ============================================================================
+--============================================================================
 -- AUTOCMDS
 -- ============================================================================
 
@@ -467,15 +498,15 @@ local function get_notes_path()
   if os_release:match("Manjaro") or os_release:match("Arch Linux") then
     path = vim.fn.expand("~/Documents/Notes")
   elseif os_release:match("Ubuntu") then -- WSL/Ubuntu box
-    path = "/mnt/c/Users/Rad/Documents/Notes"
-  else
+    path = "/mnt/c/Users/Jose/Documents/Notes" else
     path = vim.fn.expand("~/Documents/Notes")
   end
   if vim.fn.isdirectory(path) == 0 then
     vim.fn.mkdir(path, "p")
   end
   return path
-end 
+end
+
 
 local function setup_obsidian()
   require("obsidian").setup({
@@ -523,6 +554,12 @@ vim.api.nvim_set_hl(0, "NvimTreeEndOfBuffer", { bg = "none" })
 
 require("fzf-lua").setup({})
 
+	keymap = {
+		fzf = {
+			["ctrl-j"] = "down",
+			["ctrl-k"] = "up",
+		},
+	},
 vim.keymap.set("n", "<leader>ff", function()
 	require("fzf-lua").files()
 end, { desc = "FZF Files" })
@@ -542,6 +579,15 @@ vim.keymap.set("n", "<leader>fX", function()
 	require("fzf-lua").diagnostics_workspace()
 end, { desc = "FZF Diagnostics Workspace" })
 
+vim.api.nvim_create_autocmd("FileType", {
+	group = augroup,
+	pattern = "fzf",
+	callback = function(args)
+		for _, key in ipairs({ "<C-j>", "<C-k>" }) do
+			vim.keymap.set("t", key, key, { buffer = args.buf, nowait = true })
+		end
+	end,
+})
 require("mini.ai").setup({})
 require("mini.comment").setup({
 	options = {
@@ -826,7 +872,16 @@ vim.lsp.config("pyright", {})
 vim.lsp.config("bashls", {})
 vim.lsp.config("ts_ls", {})
 vim.lsp.config("gopls", {})
-vim.lsp.config("clangd", {})
+vim.lsp.config("clangd", {
+	cmd = {
+		"clangd",
+		"--background-index",
+		"--clang-tidy",
+		"--header-insertion=iwyu",
+		"--completion-style=detailed",
+		"--function-arg-placeholders=true",
+	},
+})
 vim.lsp.config("omnisharp", {})
 
 vim.g.rustaceanvim = {
@@ -850,7 +905,6 @@ do
 	local shellcheck = require("efmls-configs.linters.shellcheck")
 	local shfmt = require("efmls-configs.formatters.shfmt")
 
-	local cpplint = require("efmls-configs.linters.cpplint")
 	local clangfmt = require("efmls-configs.formatters.clang_format")
 
 	local go_revive = require("efmls-configs.linters.go_revive")
@@ -879,9 +933,9 @@ do
 		init_options = { documentFormatting = true },
 		settings = {
 			languages = {
-				c = { clangfmt, cpplint },
+				c = { clangfmt},
 				go = { gofumpt, go_revive },
-				cpp = { clangfmt, cpplint },
+				cpp = { clangfmt},
 				css = { prettier_d },
 				html = { prettier_d },
 				javascript = { eslint_d, prettier_d },
@@ -915,6 +969,27 @@ vim.lsp.enable({
 -- ============================================================================
 -- FLOATING TERMINAL
 -- ============================================================================
+vim.api.nvim_create_autocmd("TermOpen", {
+	group = augroup,
+	callback = function()
+		vim.opt_local.number = false
+		vim.opt_local.relativenumber = false
+		vim.opt_local.signcolumn = "no"
+		vim.cmd("startinsert")
+	end,
+})
+
+-- re-enter terminal mode whenever a terminal window gets focus
+vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+	group = augroup,
+	pattern = "term://*",
+	callback = function()
+		vim.cmd("startinsert")
+	end,
+})
+
+-- clicking inside the terminal no longer drops you to Normal mode
+vim.keymap.set("t", "<LeftMouse>", "<Nop>", { desc = "Ignore clicks in terminal mode" })
 vim.api.nvim_create_autocmd("TermClose", {
 	group = augroup,
 	callback = function()
@@ -923,16 +998,6 @@ vim.api.nvim_create_autocmd("TermClose", {
 		end
 	end,
 })
-
-vim.api.nvim_create_autocmd("TermOpen", {
-	group = augroup,
-	callback = function()
-		vim.opt_local.number = false
-		vim.opt_local.relativenumber = false
-		vim.opt_local.signcolumn = "no"
-	end,
-})
-
 local terminal_state = { buf = nil, win = nil, is_open = false }
 
 local function FloatingTerminal()
@@ -1021,4 +1086,19 @@ vim.keymap.set("n", "<F5>", function()
 	end
 end, { desc = "Compile and run C++ file" })
 
+if vim.fn.has("wsl") == 1 then
+    vim.g.clipboard = {
+        name = 'win32yank-wsl',
+        copy = {
+            ['+'] = 'win32yank.exe -i --crlf',
+            ['*'] = 'win32yank.exe -i --crlf',
+        },
+        paste = {
+            ['+'] = 'win32yank.exe -o --lf',
+            ['*'] = 'win32yank.exe -o --lf',
+        },
+        cache_enabled = 0,
+    }
+end
 
+vim.opt.clipboard = 'unnamedplus'
