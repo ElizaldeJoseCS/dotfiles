@@ -183,6 +183,10 @@ vim.keymap.set("v", ">", ">gv", { desc = "Indent right and reselect" })
 vim.keymap.set("n", "J", "mzJ`z", { desc = "Join lines and keep cursor position" })
 vim.keymap.set("i", "ii", "<Esc>", { desc = "Escape to Normal Mode" })
 vim.keymap.set("n", "<leader>pa", function() -- show file path
+	local path = vim.fn.expand("%:p")
+	vim.fn.setreg("+", path)
+	print("file:", path)
+end, { desc = "Copy full file path cool" })
 
 -- C++ keybinds
 vim.keymap.set("n", "<leader>gh", function()
@@ -193,11 +197,13 @@ vim.opt.makeprg = "g++ -std=c++17 -Wall -Wextra % -o %:r"
 
 vim.keymap.set("n", "<leader>cc", "<cmd>make<CR>", { desc = "Compile (quickfix)" })
 vim.keymap.set("n", "]q", "<cmd>cnext<CR>", { desc = "Next quickfix error" })
-vim.keymap.set("n", "[q", "<cmd>cprev<CR>", { desc = "Prev quickfix error" })local path = vim.fn.expand("%:p")
+vim.keymap.set("n", "[q", "<cmd>cprev<CR>", { desc = "Prev quickfix error" })
 
-vim.fn.setreg("+", path)
-print("file:", path)
-end, { desc = "Copy full file path cool" })
+vim.keymap.set("n", "<leader>th", function()
+	vim.g.auto_hover_disabled = not vim.g.auto_hover_disabled
+	vim.cmd.redrawstatus()
+	print("statusline type:", vim.g.auto_hover_disabled and "off" or "on")
+end, { desc = "Toggle type in statusline" })
 
 vim.keymap.set("n", "<leader>td", function()
 	vim.diagnostic.enable(not vim.diagnostic.is_enabled())
@@ -293,6 +299,7 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 		"*.cpp",
 		"*.h",
 		"*.hpp",
+		"*.hs",
 	},
 	callback = function(args)
 		-- avoid formatting non-file buffers (helps prevent weird write prompts)
@@ -306,14 +313,17 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 			return
 		end
 
-		local has_efm = false
+		-- Haskell is formatted by hls (ormolu); everything else by efm
+		local formatter = vim.bo[args.buf].filetype == "haskell" and "hls" or "efm"
+
+		local has_formatter = false
 		for _, c in ipairs(vim.lsp.get_clients({ bufnr = args.buf })) do
-			if c.name == "efm" then
-				has_efm = true
+			if c.name == formatter then
+				has_formatter = true
 				break
 			end
 		end
-		if not has_efm then
+		if not has_formatter then
 			return
 		end
 
@@ -321,7 +331,7 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 			bufnr = args.buf,
 			timeout_ms = 2000,
 			filter = function(c)
-				return c.name == "efm"
+				return c.name == formatter
 			end,
 		})
 	end,
@@ -425,6 +435,7 @@ local setup_treesitter = function()
 		"vue",
 		"svelte",
 		"bash",
+		"haskell",
 	}
 
 	local config = require("nvim-treesitter.config")
@@ -572,7 +583,19 @@ require("lualine").setup({
 	sections = {
 		lualine_a = { "mode" },
 		lualine_b = { { "branch", icon = "\u{e725}" } }, -- nf-dev-git_branch
-		lualine_c = { { "filename", path = 0 } },
+		lualine_c = {
+			{ "filename", path = 0 },
+			{
+				-- type of the symbol under the cursor (set by the LSP hover autocmd)
+				function()
+					return vim.b.hover_type or ""
+				end,
+				cond = function()
+					return not vim.g.auto_hover_disabled and vim.b.hover_type ~= nil
+				end,
+				icon = "\u{f0295}", -- nf-md-function
+			},
+		},
 		lualine_x = {
 			function()
 				local size = vim.fn.getfsize(vim.fn.expand("%"))
@@ -745,6 +768,87 @@ local function lsp_on_attach(ev)
 
 	vim.keymap.set("n", "K", vim.lsp.buf.hover, opts)
 
+	-- Statusline type: when the cursor rests on a symbol (updatetime = 300ms), ask
+	-- the LSP for hover info, pull out the one-line type, and store it in
+	-- vim.b.hover_type for lualine to show. Cleared as soon as the cursor moves.
+	-- Toggle with <leader>th.
+	if client:supports_method("textDocument/hover", bufnr) and not vim.b[bufnr].hover_type_set then
+		vim.b[bufnr].hover_type_set = true -- only one set of autocmds per buffer, even with several LSPs
+
+		local function set_type(text)
+			if vim.api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].hover_type ~= text then
+				vim.b[bufnr].hover_type = text
+				vim.cmd.redrawstatus()
+			end
+		end
+
+		-- Pick the single most useful line out of the hover markdown
+		local function extract_type(lines)
+			-- clangd style: "Type: `int`"
+			for _, l in ipairs(lines) do
+				local t = l:match("^Type:%s*(.+)")
+				if t then
+					return (t:gsub("`", ""))
+				end
+			end
+			-- hls / most servers: first real line inside the first ``` code block
+			local in_code = false
+			for _, l in ipairs(lines) do
+				if l:match("^```") then
+					if in_code then
+						break
+					end
+					in_code = true
+				elseif in_code and not l:match("^%s*//") and not l:match("^%s*%-%-") and l:match("%S") then
+					return vim.trim(l)
+				end
+			end
+			-- fallback: first non-empty line
+			for _, l in ipairs(lines) do
+				if l:match("%S") and not l:match("^```") then
+					return vim.trim((l:gsub("[`#*]", "")))
+				end
+			end
+		end
+
+		vim.api.nvim_create_autocmd({ "CursorHold", "CursorHoldI" }, {
+			group = augroup,
+			buffer = bufnr,
+			callback = function()
+				if vim.g.auto_hover_disabled then
+					return
+				end
+				local pos = vim.api.nvim_win_get_cursor(0)
+				local params = vim.lsp.util.make_position_params(0, client.offset_encoding)
+				client:request("textDocument/hover", params, function(err, result)
+					-- ignore stale answers if the cursor moved while waiting
+					local now = vim.api.nvim_win_get_cursor(0)
+					if now[1] ~= pos[1] or now[2] ~= pos[2] then
+						return
+					end
+					if err or not result or not result.contents then
+						return set_type(nil)
+					end
+					local lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents)
+					lines = vim.split(table.concat(lines, "\n"), "\n", { trimempty = true })
+					local t = extract_type(lines)
+					if t and #t > 70 then
+						t = t:sub(1, 67) .. "..."
+					end
+					set_type(t)
+				end, bufnr)
+			end,
+		})
+
+		vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufLeave" }, {
+			group = augroup,
+			buffer = bufnr,
+			callback = function()
+				set_type(nil)
+			end,
+		})
+	end
+
 	vim.keymap.set("n", "<leader>fr", function()
 		require("fzf-lua").lsp_references()
 	end, opts)
@@ -828,6 +932,21 @@ vim.lsp.config("ts_ls", {})
 vim.lsp.config("gopls", {})
 vim.lsp.config("clangd", {})
 vim.lsp.config("omnisharp", {})
+-- Haskell: haskell-language-server, installed via ghcup (not Mason) so it
+-- matches your GHC version. The wrapper picks the right HLS binary per project.
+vim.lsp.config("hls", {
+	cmd = { "haskell-language-server-wrapper", "--lsp" },
+	filetypes = { "haskell", "lhaskell", "cabal" },
+	settings = {
+		haskell = {
+			formattingProvider = "ormolu",
+			cabalFormattingProvider = "cabalfmt",
+			plugin = {
+				hlint = { globalOn = true }, -- lint suggestions as diagnostics
+			},
+		},
+	},
+})
 
 vim.g.rustaceanvim = {
 	server = {
@@ -909,6 +1028,7 @@ vim.lsp.enable({
 	"gopls",
 	"clangd",
 	"omnisharp",
+	"hls",
 	"efm",
 })
 
@@ -1020,5 +1140,3 @@ vim.keymap.set("n", "<F5>", function()
 		vim.fn.chansend(job_id, cmd)
 	end
 end, { desc = "Compile and run C++ file" })
-
-
